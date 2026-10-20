@@ -76,6 +76,91 @@ for (const file of ['docs/index.html', 'backend/static/index.html']) {
     } finally { await browser.close(); }
   });
 
+  test(`${file}: timeout não acumula consultas nem apaga dados e recupera sozinho`, async () => {
+    let op = estado();
+    op.total_mudancas = 1;
+    op.mudancas = [{ minuto: 600, voo: 'TEST-001', saiu: 'A', entrou: 'B', local: 'GRU', motivo: 'Limite' }];
+    const { page, browser, errors } = await abrir(file, async (r, u) => {
+      if (u.pathname !== '/api/operacao') return false;
+      await r.fulfill({ json: op }); return true;
+    });
+    try {
+      await page.waitForFunction(() => window.estadoOperacao?.total_mudancas === 1);
+      await page.evaluate(async () => {
+        const original = window.fetch;
+        window.consultasTeste = 0;
+        window.fetch = (url, options) => {
+          if (!String(url).endsWith('/operacao')) return original(url, options);
+          window.consultasTeste++;
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+          });
+        };
+        await Promise.all([window.carregarOperacao(), window.carregarOperacao(), window.carregarOperacao()]);
+        window.fetch = original;
+      });
+      assert.equal(await page.evaluate(() => window.consultasTeste), 1);
+      assert.match(await page.locator('#operacaoStatus').textContent(), /demorando.*últimos dados/s);
+      assert.equal(await page.locator('#remanejamentosRows tr').count(), 1);
+      assert.equal(await page.locator('#btnOperacao').textContent(), 'Pausar operação');
+      op.relogio = '2026-10-19 · 10h05';
+      // O próximo intervalo recupera a consulta sem recarregar a página.
+      await page.waitForFunction(() => document.getElementById('operacaoStatus').textContent.includes('10h05'), null, { timeout: 10000 });
+      assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+  });
+
+  test(`${file}: consulta antiga não desfaz pausa e POST incerto consulta sem repetir ação`, async () => {
+    let op = estado();
+    let pausas = 0;
+    const { page, browser, errors } = await abrir(file, async (r, u) => {
+      if (!u.pathname.startsWith('/api/operacao')) return false;
+      if (u.pathname.endsWith('/pausar')) { pausas++; op = estado(false); }
+      await r.fulfill({ json: op }); return true;
+    });
+    try {
+      await page.waitForFunction(() => window.estadoOperacao?.rodando);
+      await page.evaluate(() => {
+        const original = window.fetch;
+        window.fetch = (url, options) => {
+          if (!String(url).endsWith('/operacao')) return original(url, options);
+          return new Promise(resolve => {
+            window.liberarConsultaAntiga = () => resolve(new Response(JSON.stringify({ iniciada: true, rodando: true, mudancas: [] })));
+          });
+        };
+        window.restaurarFetch = () => { window.fetch = original; };
+        window.carregarOperacao();
+      });
+      await page.locator('.nav-btn[data-screen="escalas"]').click();
+      await page.locator('#btnOperacao').click();
+      await page.waitForFunction(() => window.estadoOperacao?.rodando === false);
+      await page.evaluate(async () => {
+        window.liberarConsultaAntiga();
+        await window.carregarOperacao();
+        window.restaurarFetch();
+      });
+      assert.equal(await page.locator('#btnOperacao').textContent(), 'Continuar operação');
+      assert.equal(pausas, 1);
+      // O servidor aplica iniciar, mas a resposta se perde. Só o GET é repetido.
+      await page.evaluate(() => {
+        const original = window.fetch;
+        window.iniciosTeste = 0;
+        window.fetch = async (url, options) => {
+          if (String(url).endsWith('/operacao/iniciar')) {
+            window.iniciosTeste++;
+            throw new DOMException('signal timed out', 'TimeoutError');
+          }
+          return original(url, options);
+        };
+      });
+      op = estado(true);
+      await page.locator('#btnOperacao').click();
+      await page.waitForFunction(() => window.estadoOperacao?.rodando === true);
+      assert.equal(await page.evaluate(() => window.iniciosTeste), 1);
+      assert.deepEqual(errors, []);
+    } finally { await browser.close(); }
+  });
+
   test(`${file}: perfil lento não trava navegação e falha da operação fica visível`, async () => {
     let falha = false;
     const { page, browser, errors } = await abrir(file, async (r, u) => {

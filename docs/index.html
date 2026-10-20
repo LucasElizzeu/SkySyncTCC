@@ -792,7 +792,7 @@
 
       <div class="setting-card" style="margin-bottom:20px">
         <h2 class="setting-card-title">Estado da aplicação</h2>
-        <p>Interface: <strong id="interfaceVersion">operacao-7</strong></p>
+        <p>Interface: <strong id="interfaceVersion">operacao-8</strong></p>
         <p id="sessionStatus" role="status">Verificando sessão…</p>
         <button type="button" class="btn-secondary" id="btnDiagnostico">Verificar conexão</button>
         <p id="connectionStatus" role="status">Aguardando verificação.</p>
@@ -993,8 +993,8 @@ const API_URL = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hos
   : 'https://skysync-api.onrender.com/api';
 
 // Um serviço indisponível não pode deixar a tela carregando indefinidamente.
-function fetchComPrazo(url, options = {}) {
-  return fetch(url, { ...options, signal: AbortSignal.timeout(20000) });
+function fetchComPrazo(url, options = {}, prazo = 20000) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(prazo) });
 }
 
 async function sairSkySync(button) {
@@ -2025,26 +2025,64 @@ async function iniciarPainel() {
       });
       document.getElementById('remanejamentosVazio').hidden = Boolean((dados.mudancas || []).length);
     }
-    window.carregarOperacao = async function () {
-      try {
-        const res = await fetchComPrazo(`${API_URL}/operacao`, { credentials: 'include' });
-        if (res.status === 401) { window.location.href = 'login.html'; return; }
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        mostrarOperacao(await res.json());
-      } catch (e) { document.getElementById('operacaoStatus').textContent = 'Não foi possível consultar a operação: ' + e.message; }
+    let consultaOperacao = null;
+    let alterandoOperacao = false;
+    let versaoOperacao = 0;
+    function falhaTemporariaOperacao(erro) {
+      return ['TimeoutError', 'AbortError', 'TypeError'].includes(erro.name);
+    }
+    window.carregarOperacao = function () {
+      // O intervalo e a navegação compartilham a mesma consulta em andamento.
+      if (alterandoOperacao) return Promise.resolve();
+      if (consultaOperacao) return consultaOperacao;
+      const versao = versaoOperacao;
+      consultaOperacao = (async () => {
+        try {
+          const res = await fetchComPrazo(`${API_URL}/operacao`, { credentials: 'include', cache: 'no-store' }, 60000);
+          if (versao !== versaoOperacao) return;
+          if (res.status === 401) { window.location.href = 'login.html'; return; }
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const dados = await res.json();
+          if (versao === versaoOperacao) mostrarOperacao(dados);
+        } catch (e) {
+          if (versao !== versaoOperacao) return;
+          document.getElementById('operacaoStatus').textContent = falhaTemporariaOperacao(e)
+            ? 'A API está demorando para responder. Tentando atualizar novamente…' +
+              (window.estadoOperacao ? ' Os últimos dados recebidos continuam na tela.' : '')
+            : 'Não foi possível consultar a operação: ' + e.message + '. Tentando novamente…';
+        } finally { consultaOperacao = null; }
+      })();
+      return consultaOperacao;
     };
     document.getElementById('btnOperacao').addEventListener('click', async e => {
       e.target.disabled = true;
+      alterandoOperacao = true;
+      ++versaoOperacao; // Uma consulta antiga não pode sobrescrever iniciar/pausar.
       document.getElementById('operacaoStatus').textContent = 'Atualizando operação…';
+      let confirmarEstado = false;
       try {
         const acao = window.estadoOperacao && window.estadoOperacao.rodando ? 'pausar' : 'iniciar';
-        const res = await fetchComPrazo(`${API_URL}/operacao/${acao}`, { method: 'POST', credentials: 'include' });
+        const res = await fetchComPrazo(`${API_URL}/operacao/${acao}`, { method: 'POST', credentials: 'include' }, 60000);
         if (res.status === 401) { window.location.href = 'login.html'; return; }
         const dados = await res.json();
-        if (!res.ok) throw new Error(dados.erro || 'HTTP ' + res.status);
+        if (!res.ok && res.status < 500) {
+          document.getElementById('operacaoStatus').textContent = 'Não foi possível alterar a operação: ' + (dados.erro || 'HTTP ' + res.status);
+          return;
+        }
+        if (!res.ok) throw new Error('HTTP ' + res.status);
         mostrarOperacao(dados);
-      } catch (err) { document.getElementById('operacaoStatus').textContent = 'Operação não iniciada/alterada: ' + err.message; }
-      finally { e.target.disabled = false; }
+      } catch (err) {
+        confirmarEstado = true;
+        document.getElementById('operacaoStatus').textContent = 'Não foi possível confirmar a alteração. Consultando o estado da operação…';
+      } finally {
+        alterandoOperacao = false;
+        e.target.disabled = false;
+        // Não repete o POST: ele pode ter sido aplicado antes do tempo limite.
+        if (confirmarEstado) {
+          if (consultaOperacao) await consultaOperacao;
+          window.carregarOperacao();
+        }
+      }
     });
 
     // ---------------------------------------------------------------------
